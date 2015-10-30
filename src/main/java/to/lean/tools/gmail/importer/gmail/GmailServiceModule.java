@@ -23,8 +23,10 @@ import com.google.api.client.json.JsonFactory;
 import com.google.api.client.json.jackson.JacksonFactory;
 import com.google.api.client.util.BackOff;
 import com.google.api.client.util.ExponentialBackOff;
+import com.google.api.services.gmail.Gmail;
 import com.google.inject.AbstractModule;
 import com.google.inject.Provides;
+import com.google.inject.assistedinject.FactoryModuleBuilder;
 import to.lean.tools.gmail.importer.CommandLineArguments;
 
 import javax.inject.Singleton;
@@ -39,7 +41,9 @@ public class GmailServiceModule extends AbstractModule {
   protected void configure() {
     requireBinding(CommandLineArguments.class);
 
-    bind(GmailService.class).in(Singleton.class);
+    bind(Gmail.class).toProvider(GmailApiProvider.class);
+    bind(GmailApiProvider.class).in(Singleton.class);
+
     bind(Credential.class)
         .toProvider(Authorizer.class)
         .in(Singleton.class);
@@ -51,6 +55,10 @@ public class GmailServiceModule extends AbstractModule {
             .setRandomizationFactor(0.5)
             .setMaxIntervalMillis(60000)
             .setMaxElapsedTimeMillis(300000));
+
+    install(new FactoryModuleBuilder()
+        .implement(GmailService.class, GmailServiceImpl.class)
+        .build(GmailServiceFactory.class));
   }
 
   @Provides @Singleton

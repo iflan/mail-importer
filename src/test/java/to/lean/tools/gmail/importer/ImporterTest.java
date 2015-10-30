@@ -27,7 +27,6 @@ import org.mockito.Mock;
 import org.mockito.MockitoAnnotations;
 import org.mockito.invocation.InvocationOnMock;
 import org.mockito.stubbing.Answer;
-import to.lean.tools.gmail.importer.gmail.GmailService;
 import to.lean.tools.gmail.importer.gmail.GmailSyncer;
 import to.lean.tools.gmail.importer.local.LocalMessage;
 import to.lean.tools.gmail.importer.local.LocalStorage;
@@ -46,7 +45,6 @@ import static org.mockito.Mockito.when;
 public class ImporterTest {
 
   @Mock private GmailSyncer gmailSyncer;
-  @Mock private GmailService gmailService;
   @Mock private LocalStorage localStorage;
   @Mock private Iterator<LocalMessage> localStorageIterator;
 

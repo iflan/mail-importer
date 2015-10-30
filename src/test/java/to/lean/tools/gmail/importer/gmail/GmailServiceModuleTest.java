@@ -16,6 +16,7 @@
 
 package to.lean.tools.gmail.importer.gmail;
 
+import com.google.inject.AbstractModule;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.JUnit4;

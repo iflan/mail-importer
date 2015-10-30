@@ -16,53 +16,52 @@
 
 package to.lean.tools.gmail.importer.gmail;
 
-import com.google.api.client.auth.oauth2.Credential;
-import com.google.api.client.http.HttpBackOffUnsuccessfulResponseHandler;
-import com.google.api.client.http.HttpRequestInitializer;
-import com.google.api.client.http.HttpTransport;
-import com.google.api.client.json.JsonFactory;
-import com.google.api.client.util.BackOff;
-import com.google.api.services.gmail.Gmail;
+import com.google.api.services.gmail.model.Label;
+import com.google.common.collect.ImmutableList;
 
-import javax.inject.Inject;
-import javax.inject.Provider;
+import java.io.IOException;
+import java.util.NoSuchElementException;
+import java.util.Optional;
 
 /**
- * Constructs a {@link Gmail} instance that is ready for use.
+ * A user-oriented facade over {@link com.google.api.services.gmail.Gmail}.
  */
-public class GmailService {
+interface GmailService {
 
-  private final Credential credential;
-  private final Provider<BackOff> backOffProvider;
-  private final HttpTransport httpTransport;
-  private final JsonFactory jsonFactory;
+  /**
+   * Returns a list of all labels in the user's account.
+   */
+  ImmutableList<Label> labels() throws GmailServiceException;
 
-  @Inject
-  GmailService(
-      User user,
-      Credential credential,
-      Provider<BackOff> backOffProvider,
-      HttpTransport httpTransport,
-      JsonFactory jsonFactory) {
-    this.credential = credential;
-    this.backOffProvider = backOffProvider;
-    this.httpTransport = httpTransport;
-    this.jsonFactory = jsonFactory;
+  /** Returns the {@code Label} for the given {@code id}. */
+  Optional<Label> getLabelById(String id);
+
+  /**
+   * Returns the {@code Label} for the given {@code name}.
+   *
+   * @throws NoSuchElementException if there is no such label.
+   */
+  Optional<Label> getLabelByName(String name);
+
+  /**
+   * Creates a new label with the given name.
+   *
+   * @return the new {@code Label}
+   */
+  Label createLabel(String name);
+
+  class GmailServiceException extends RuntimeException {
+    public GmailServiceException(IOException e) {
+      super(e);
+    }
+
+    public GmailServiceException(String message) {
+      super(message);
+    }
+
+    public static GmailServiceException forException(IOException e) {
+      // TODO(flan): Split this into different exceptions
+      return new GmailServiceException(e);
+    }
   }
-
-  Gmail getServiceWithRetries() {
-    HttpRequestInitializer httpRequestInitializer =
-        request -> {
-          credential.initialize(request);
-          new UnsuccessfulResponseHandlerChainer().chain(
-              request.getUnsuccessfulResponseHandler(),
-              new HttpBackOffUnsuccessfulResponseHandler(
-                  backOffProvider.get()));
-        };
-
-    return new Gmail.Builder(httpTransport, jsonFactory, httpRequestInitializer)
-        .setApplicationName(GmailServiceModule.APP_NAME)
-        .build();
-  }
-
 }

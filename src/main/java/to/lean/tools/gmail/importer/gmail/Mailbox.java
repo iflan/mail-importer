@@ -25,11 +25,9 @@ import com.google.api.client.http.HttpHeaders;
 import com.google.api.client.repackaged.com.google.common.base.Preconditions;
 import com.google.api.services.gmail.Gmail;
 import com.google.api.services.gmail.model.Label;
-import com.google.api.services.gmail.model.ListLabelsResponse;
 import com.google.api.services.gmail.model.ListMessagesResponse;
 import com.google.api.services.gmail.model.Message;
 import com.google.api.services.gmail.model.ModifyMessageRequest;
-import com.google.common.base.Verify;
 import com.google.common.collect.BiMap;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
@@ -40,6 +38,7 @@ import com.google.common.io.ByteStreams;
 import to.lean.tools.gmail.importer.local.LocalMessage;
 
 import javax.inject.Inject;
+import javax.inject.Provider;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -61,41 +60,21 @@ import static java.util.stream.Collectors.toSet;
 class Mailbox {
   static final int TOO_MANY_CONCURRENT_REQUESTS_FOR_USER = 429;
 
-  private final GmailService gmailService;
+  private final Provider<Gmail> gmailApiProvider;
   private final User user;
-
-  private Map<String, Label> labelsById;
-  private Map<String, Label> labelsByName;
+  private final GmailService gmailService;
 
   @Inject
   Mailbox(
-      GmailService gmailService,
+      Provider<Gmail> gmailApiProvider,
+      GmailServiceFactory gmailServiceFactory,
       User user) {
-    this.gmailService = gmailService;
+    this.gmailApiProvider = gmailApiProvider;
     this.user = user;
+    this.gmailService = gmailServiceFactory.create(user);
   }
 
   void connect() throws IOException {
-    loadLabels();
-  }
-
-  /**
-   * Loads the user's labels and remembers them.
-   */
-  void loadLabels() throws IOException {
-    ListLabelsResponse labelResponse = gmailService.getServiceWithRetries()
-        .users()
-        .labels()
-        .list(user.getEmailAddress())
-        .execute();
-
-    Verify.verify(!labelResponse.isEmpty(), "could not get labels %s");
-
-    List<Label> labels = labelResponse.getLabels();
-    labelsByName =
-        labels.stream().collect(toMap(Label::getName, label -> label));
-    labelsById = labels.stream().collect(toMap(Label::getId, label -> label));
-    System.err.format("Got labels: %s", labelsByName);
   }
 
   Multimap<LocalMessage, Message> mapMessageIds(
@@ -103,7 +82,7 @@ class Mailbox {
     Multimap<LocalMessage, Message> results =
         MultimapBuilder.hashKeys().linkedListValues().build();
 
-    Gmail gmail = gmailService.getServiceWithRetries();
+    Gmail gmail = gmailApiProvider.get();
     BatchRequest batch = gmail.batch();
 
     try {
@@ -146,7 +125,7 @@ class Mailbox {
   }
 
   void fetchExistingLabels(Iterable<Message> messages) {
-    Gmail gmail = gmailService.getServiceWithRetries();
+    Gmail gmail = gmailApiProvider.get();
     BatchRequest batch = gmail.batch();
 
     try {
@@ -176,8 +155,8 @@ class Mailbox {
                 System.out.format("For message %s, got labels: %s\n",
                     responseMessage.getId(),
                     gmailMessageIds.stream()
-                        .map(id -> labelsById.getOrDefault(
-                            id, new Label().setName(id)))
+                        .map(id -> gmailService.getLabelById(id)
+                            .orElse(new Label().setName(id)))
                         .map(Label::getName)
                         .collect(Collectors.joining(", ")));
                 message.setLabelIds(gmailMessageIds);
@@ -194,7 +173,7 @@ class Mailbox {
 
   Message uploadMessage(LocalMessage localMessage)
       throws GoogleJsonResponseException {
-    Gmail gmail = gmailService.getServiceWithRetries();
+    Gmail gmail = gmailApiProvider.get();
     try {
       Gmail.Users.Messages.GmailImport r = gmail.users()
           .messages()
@@ -251,7 +230,7 @@ class Mailbox {
       BatchRequest thisBatch;
       BatchRequest nextBatch;
     }
-    Gmail gmail = gmailService.getServiceWithRetries();
+    Gmail gmail = gmailApiProvider.get();
     Batches batches = new Batches();
     batches.thisBatch = gmail.batch();
     batches.nextBatch = gmail.batch();
@@ -285,10 +264,12 @@ class Mailbox {
         }
 
         List<String> labelIdsToAdd = labelNamesToAdd.stream()
-            .map(labelName -> labelsByName.get(labelName).getId())
+            .map(labelName ->
+                gmailService.getLabelByName(labelName).get().getId())
             .collect(toList());
         List<String> labelIdsToRemove = labelNamesToRemove.stream()
-            .map(labelName -> labelsByName.get(labelName).getId())
+            .map(labelName ->
+                gmailService.getLabelByName(labelName).get().getId())
             .collect(toList());
 
         Gmail.Users.Messages.Modify request = gmail.users()

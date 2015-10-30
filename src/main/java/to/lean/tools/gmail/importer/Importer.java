@@ -17,6 +17,7 @@
 package to.lean.tools.gmail.importer;
 
 import com.google.api.client.util.Lists;
+import com.google.inject.AbstractModule;
 import com.google.inject.Guice;
 import com.google.inject.Inject;
 import com.google.inject.Injector;
@@ -76,7 +77,15 @@ public class Importer {
     Injector injector = Guice.createInjector(
         new FlagsModule(commandLineArguments),
         new ThunderbirdModule(),
-        new GmailServiceModule());
+        new GmailServiceModule(),
+        new AbstractModule() {
+          @Override
+          protected void configure() {
+            binder().requireAtInjectOnConstructors();
+            binder().requireExactBindingAnnotations();
+            binder().disableCircularProxies();
+          }
+        });
 
     Importer importer = injector.getInstance(Importer.class);
     importer.importMail();
