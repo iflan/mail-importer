@@ -61,7 +61,7 @@ public class Importer {
    * @throws IOException if there is a problem with the Gmail connection
    */
   public static void main(String[] args)
-      throws MessagingException, IOException {
+      throws MessagingException, IOException, InterruptedException {
     CommandLineArguments commandLineArguments =
         new CommandLineArguments();
     CmdLineParser commandLine =
@@ -103,7 +103,8 @@ public class Importer {
     this.commandLineArguments = commandLineArguments;
   }
 
-  public void importMail() throws MessagingException, IOException {
+  public void importMail()
+      throws MessagingException, IOException, InterruptedException {
     LocalStorage storage = storageProvider.get();
     gmailSyncer.init();
 

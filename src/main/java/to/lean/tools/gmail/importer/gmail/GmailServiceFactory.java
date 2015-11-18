@@ -26,5 +26,6 @@ interface GmailServiceFactory {
    * the java.lang.reflect.Proxy doesn't support this. See:
    * https://github.com/google/guice/blob/87cd5ad7a3590d9288a9366e333b6878a54b2d14/extensions/assistedinject/src/com/google/inject/assistedinject/FactoryProvider2.java#L434
    */
+
   GmailService create(User user);
 }

@@ -16,20 +16,29 @@
 
 package to.lean.tools.gmail.importer.gmail;
 
+import com.google.api.client.googleapis.batch.BatchRequest;
+import com.google.api.client.googleapis.batch.json.JsonBatchCallback;
+import com.google.api.client.googleapis.json.GoogleJsonError;
+import com.google.api.client.http.AbstractInputStreamContent;
+import com.google.api.client.http.HttpContent;
+import com.google.api.client.http.HttpHeaders;
 import com.google.api.services.gmail.Gmail;
 import com.google.api.services.gmail.model.Label;
 import com.google.api.services.gmail.model.ListLabelsResponse;
+import com.google.api.services.gmail.model.ListMessagesResponse;
+import com.google.api.services.gmail.model.Message;
 import com.google.common.collect.ImmutableList;
 import com.google.inject.assistedinject.Assisted;
 
 import javax.annotation.concurrent.NotThreadSafe;
 import javax.inject.Inject;
-import javax.inject.Provider;
 import java.io.IOException;
 import java.util.List;
 import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ForkJoinPool;
 import java.util.function.Supplier;
 
 import static java.util.stream.Collectors.toMap;
@@ -45,88 +54,173 @@ import static java.util.stream.Collectors.toMap;
 public class GmailServiceImpl implements GmailService {
 
   private final User user;
-  private final Provider<Gmail> gmailApiProvider;
-
-  private List<Label> labels;
-  private Map<String, Label> labelsById;
-  private Map<String, Label> labelsByName;
-
+  private final Gmail gmail;
+  final Supplier<BatchRequest> batchSupplier;
 
   @Inject
-  GmailServiceImpl(@Assisted User user,
-      Provider<Gmail> gmailApiProvider) {
+  GmailServiceImpl(
+      @Assisted User user,
+      Gmail gmail) {
+    this(user, gmail, gmail::batch);
+  }
+
+  GmailServiceImpl(
+      User user,
+      Gmail gmail,
+      Supplier<BatchRequest> batchSupplier) {
     this.user = user;
-    this.gmailApiProvider = gmailApiProvider;
+    this.gmail = gmail;
+    this.batchSupplier = batchSupplier;
   }
 
   @Override
-  public ImmutableList<Label> labels() throws GmailServiceException {
-    maybeLoadLabels();
-    return ImmutableList.copyOf(labels);
+  public Batch newBatch() {
+    BatchRequest batch = gmail.batch();
+    return new BatchImpl(user, gmail, () -> batch);
   }
 
   @Override
-  public Optional<Label> getLabelById(String id) {
-    maybeLoadLabels();
-    return Optional.ofNullable(labelsById.get(id));
+  public CompletableFuture<ListMessagesResponse> query(Query query) {
+    GmailApiFuture<ListMessagesResponse> future = new GmailApiFuture<>();
+    ForkJoinPool.commonPool().execute(() -> {
+      // We use a batch request even in immediate mode to keep the callback
+      // interface the same.
+      BatchRequest batch = batchSupplier.get();
+
+      try {
+        gmail.users().messages().list(user.getEmailAddress())
+            .setQ(query.getQuery())
+            .setFields(query.getField().getRepr())
+            .queue(batch, future.getBatchCallback());
+        batch.execute();
+      } catch (IOException e) {
+        future.completeExceptionally(e);
+      }
+    });
+    return future;
   }
 
   @Override
-  public Optional<Label> getLabelByName(String name) {
-    maybeLoadLabels();
-    return Optional.ofNullable(labelsByName.get(name));
+  public CompletableFuture<Message> message(String messageId, String fields) {
+    GmailApiFuture<Message> future = new GmailApiFuture<>();
+    ForkJoinPool.commonPool().execute(() -> {
+      // We use a batch request even in immediate mode to keep the callback
+      // interface the same.
+      BatchRequest batch = batchSupplier.get();
+
+      try {
+        gmail.users().messages().get(user.getEmailAddress(), messageId)
+            .setFields(fields)
+            .queue(batch, future.getBatchCallback());
+        batch.execute();
+      } catch (IOException e) {
+        future.completeExceptionally(e);
+      }
+    });
+    return future;
   }
 
   @Override
-  public Label createLabel(String name) {
-    throw new UnsupportedOperationException();
-
+  public CompletableFuture<Message> modify(
+      String id, List<String> labelIdsToAdd, List<String> labelIdsToRemove) {
+    return null;
   }
 
-  private void maybeLoadLabels() {
-    if (labels != null) {
-      return;
-    }
+  @Override
+  public CompletableFuture<Message> importMessage(
+      AbstractInputStreamContent streamContent) {
+    GmailApiFuture<Message> future = new GmailApiFuture<>();
+    ForkJoinPool.commonPool().execute(() -> {
+      // We use a batch request even in immediate mode to keep the callback
+      // interface the same.
+      BatchRequest batch = batchSupplier.get();
 
-    ListLabelsResponse labelResponse;
-    try {
-      labelResponse = gmailApiProvider.get()
-          .users()
-          .labels()
-          .list(user.getEmailAddress())
-          .execute();
-    } catch (IOException e) {
-      throw GmailServiceException.forException(e);
-    }
-
-    verify(!labelResponse.isEmpty(), "could not get labels");
-
-    labels = labelResponse.getLabels();
-    labelsByName =
-        labels.stream().collect(toMap(Label::getName, label -> label));
-    labelsById = labels.stream().collect(toMap(Label::getId, label -> label));
-    System.err.format("Got labels: %s", labelsByName);
+      try {
+        Gmail.Users.Messages.GmailImport r = gmail.users()
+            .messages()
+            .gmailImport(user.getEmailAddress(),
+                new Message(),
+                streamContent);
+        r.queue(batch, future.getBatchCallback());
+        batch.execute();
+      } catch (IOException e) {
+        future.completeExceptionally(e);
+      }
+    });
+    return future;
   }
 
-  private void verify(boolean expression, String message) {
-    if (!expression) {
-      // TODO(flan): Throw a more specific exception
-      throw new GmailServiceException(message);
+  @Override
+  public CompletableFuture<ListLabelsResponse> labels() {
+    GmailApiFuture<ListLabelsResponse> future = new GmailApiFuture<>();
+    ForkJoinPool.commonPool().execute(() -> {
+      // We use a batch request even in immediate mode to keep the callback
+      // interface the same.
+      BatchRequest batch = batchSupplier.get();
+
+      try {
+        gmail.users().labels().list(user.getEmailAddress())
+            .queue(batch, future.getBatchCallback());
+        batch.execute();
+      } catch (IOException e) {
+        future.completeExceptionally(e);
+      }
+    });
+    return future;
+  }
+
+  /**
+   * Wraps common logic for dealing with the Gmail API.
+   *
+   * @param <T> the return type of the future
+   */
+  private static class GmailApiFuture<T> extends CompletableFuture<T> {
+    JsonBatchCallback<T> getBatchCallback() {
+      return new JsonBatchCallback<T>() {
+        @Override
+        public void onFailure(
+            GoogleJsonError e, HttpHeaders responseHeaders)
+            throws IOException {
+          GmailApiFuture.this.completeExceptionally(
+              new GmailServiceRequestException(e, responseHeaders));
+        }
+
+        @Override
+        public void onSuccess(
+            T response,
+            HttpHeaders responseHeaders)
+            throws IOException {
+          GmailApiFuture.this.complete(response);
+        }
+      };
     }
   }
 
-  private void verify(boolean expression, Supplier<String> messageSupplier) {
-    if (!expression) {
-      // TODO(flan): Throw a more specific exception
-      throw new GmailServiceException(messageSupplier.get());
+  /**
+   * Batch wrapper. This allows batches to be re-used, which is against the
+   * contract.
+   */
+  // TODO(flan): Respect the contract
+  private static class BatchImpl extends GmailServiceImpl implements Batch {
+    public BatchImpl(
+        User user,
+        Gmail gmail,
+        Supplier<BatchRequest> batchSupplier) {
+      super(user, gmail, batchSupplier);
+    }
+
+    @Override
+    public CompletableFuture<Void> execute() {
+      if (batchSupplier.get().size() == 0) {
+        return CompletableFuture.completedFuture(null);
+      }
+      return CompletableFuture.runAsync(() -> {
+        try {
+          batchSupplier.get().execute();
+        } catch (IOException e) {
+          throw GmailServiceException.forException(e);
+        }
+      });
     }
   }
-
-  private <T> T verifyNotNull(T o) {
-    if (o == null) {
-      throw new NoSuchElementException();
-    }
-    return o;
-  }
-
 }

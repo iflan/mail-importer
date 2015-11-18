@@ -16,42 +16,193 @@
 
 package to.lean.tools.gmail.importer.gmail;
 
-import com.google.api.services.gmail.model.Label;
-import com.google.common.collect.ImmutableList;
+import com.google.api.client.googleapis.json.GoogleJsonError;
+import com.google.api.client.http.AbstractInputStreamContent;
+import com.google.api.client.http.HttpContent;
+import com.google.api.client.http.HttpHeaders;
+import com.google.api.services.gmail.model.ListLabelsResponse;
+import com.google.api.services.gmail.model.ListMessagesResponse;
+import com.google.api.services.gmail.model.Message;
+import com.google.auto.value.AutoValue;
+import com.google.common.base.Throwables;
 
-import java.io.IOException;
-import java.util.NoSuchElementException;
-import java.util.Optional;
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
 
 /**
- * A user-oriented facade over {@link com.google.api.services.gmail.Gmail}.
+ * A user-oriented facade over {@link com.google.api.services.gmail.Gmail} that
+ * uses {@link CompletableFuture}s instead of traditional callbacks. This allows
+ * the same interface to apply to both one-off requests and batch requests.
+ *
+ * <p>For example, a single query can be written as:
+ * <pre>{@code
+ *   gmailService
+ *       .query(
+ *           new QueryBuilder()
+ *               .rfc822MsgId("XXX@yyy")
+ *               .withFields(MESSAGE_ID)
+ *               .build())
+ *       .then[...]
+ * }</pre>
+ * <p>A batch query can be written much the same way:
+ * <pre>{@code
+ *   Batch batch = gmailService.newBatch();
+ *   batch.query(
+ *           new QueryBuilder()
+ *               .rfc822MsgId("XXX@yyy")
+ *               .withFields(MESSAGE_ID)
+ *               .build())
+ *       .then[...]
+ *   batch.query(
+ *           new QueryBuilder()
+ *               .rfc822MsgId("AAA@bbb")
+ *               .withFields(MESSAGE_ID)
+ *               .build())
+ *       .then[...]
+ *   batch.execute().get();
+ * }</pre>
+ * In fact, the return value of {@code newBatch} is another implementation of
+ * the {@code GmailService} that defers its results to the end.
+ *
+ * <p>Note that {@code batch.execute()} returns a
+ * {@code CompletableFuture<Void>} that guarantees that when it completes, all
+ * non-asynchronous dependencies of the batch will also be complete.
  */
 interface GmailService {
 
+  enum Field {
+    /** Whatever fields are returned by the server by default. */
+    DEFAULT(""),
+    /** Request that just the message IDs are returned. (Very efficient.) */
+    MESSAGE_ID("message(id)");
+
+    private final String repr;
+
+    Field(String repr) {
+      this.repr = repr;
+    }
+
+    public String getRepr() {
+      return repr;
+    }
+  }
+
+  @AutoValue
+  abstract class Query {
+
+    public static Builder builder() {
+      return new AutoValue_GmailService_Query.Builder();
+    }
+
+    abstract String getQuery();
+    abstract Field getField();
+
+    @AutoValue.Builder
+    abstract static class Builder {
+      abstract Query build();
+      abstract Builder setQuery(String query);
+      abstract Builder setField(Field field);
+
+      Builder rfc822MsgId(String rfc822MsgId) {
+        setQuery("rfc822MsgId:" + rfc822MsgId);
+        return this;
+      }
+    }
+  }
+
   /**
-   * Returns a list of all labels in the user's account.
+   * Returns a new batch interface.
    */
-  ImmutableList<Label> labels() throws GmailServiceException;
-
-  /** Returns the {@code Label} for the given {@code id}. */
-  Optional<Label> getLabelById(String id);
+  GmailService.Batch newBatch();
 
   /**
-   * Returns the {@code Label} for the given {@code name}.
+   * Sends a list messages query to the server for the current user. The query
+   * is executed asynchronously to the calling thread.
    *
-   * @throws NoSuchElementException if there is no such label.
+   * @param query the query parameters to use
+   * @return a {@code CompletableFuture} for the {@link ListMessagesResponse}.
+   *     If there is an exception during the request, it will be coerced to a
+   *     {@code GmailServiceException}.
+   *
+   * @see com.google.api.services.gmail.Gmail.Users.Messages.List
    */
-  Optional<Label> getLabelByName(String name);
+  CompletableFuture<ListMessagesResponse> query(Query query);
 
   /**
-   * Creates a new label with the given name.
+   * Sends a list messages query to the server for the current user. The query
+   * is executed asynchronously to the calling thread.
    *
-   * @return the new {@code Label}
+   * @param messageId the Gmail internal message ID to fetch
+   * @param fields a string specifying the desired response fields
+   * @return a {@code CompletableFuture} for the {@link Message}. If there is an
+   *     exception during the request, it will be coerced to a
+   *     {@code GmailServiceException}.
+   *
+   * @see com.google.api.services.gmail.Gmail.Users.Messages.List
    */
-  Label createLabel(String name);
+  CompletableFuture<Message> message(String messageId, String fields);
+
+  /**
+   * Modifies the labels on the messages with {@code id} by adding the labels
+   * in {@code labelIdsToAdd} and removing the labels in
+   * {@code labelIdsToRemove}.
+   *
+   * @param id the Gmail API's id of the message
+   * @param labelIdsToAdd the label ids of the labels to add
+   * @param labelIdsToRemove the label ids of the labels to remove
+   * @return a {@code CompletableFuture} for the {@link Message}. If there is an
+   *     exception during the request, it will be coerced to a
+   *     {@code GmailServiceException}.
+   */
+  CompletableFuture<Message> modify(
+      String id,
+      List<String> labelIdsToAdd,
+      List<String> labelIdsToRemove);
+
+  /**
+   * Uploads a raw message to Gmail. The {@code Message} returned by the future
+   * represents the message after it is uploaded. The upload is executed
+   * asynchronously to the calling thread.
+   *
+   * @param streamContent the raw message, in streaming form. This object must
+   *     be usable from the execution thread in a thread-safe manner.
+   * @return a {@code CompletableFuture} for the {@link Message} after it is
+   *     uploaded.
+   */
+  CompletableFuture<Message> importMessage(
+      AbstractInputStreamContent streamContent);
+
+  /**
+   * Sends a list labels query to the server for the current user. The query is
+   * executed asynchronously to the calling thread.
+   *
+   * @return a {@code CompletableFuture} for the {@link ListLabelsResponse}.
+   *     If there is an exception during the request, it will be coerced to a
+   *     {@code GmailServiceException}.
+   */
+  CompletableFuture<ListLabelsResponse> labels();
+
+  /**
+   * Batch interface for {@code GmailService}.
+   *
+   * <p>Methods on this interface return {@code CompletableFutures} just like
+   * the regular interface so that they can be used immediately as promises.
+   * However, the requests will not actually be executed until the
+   * {@link #execute()} method is called.
+   */
+  interface Batch extends GmailService {
+    /**
+     * Executes the requests gathered in the batch. The batch instance is no
+     * longer usable after calling this method and future calls will result in
+     * an {@code IllegalStateException}.
+     *
+     * @return a new future that can be used to wait for all of the results
+     */
+    CompletableFuture<Void> execute();
+  }
 
   class GmailServiceException extends RuntimeException {
-    public GmailServiceException(IOException e) {
+    public GmailServiceException(Throwable e) {
       super(e);
     }
 
@@ -59,9 +210,28 @@ interface GmailService {
       super(message);
     }
 
-    public static GmailServiceException forException(IOException e) {
-      // TODO(flan): Split this into different exceptions
-      return new GmailServiceException(e);
+    public static GmailServiceException forException(Exception e) {
+      return new GmailServiceException(Throwables.getRootCause(e));
+    }
+  }
+
+  class GmailServiceRequestException extends GmailServiceException {
+    private final GoogleJsonError googleJsonError;
+    private final HttpHeaders responseHeaders;
+
+    public GmailServiceRequestException(
+        GoogleJsonError googleJsonError, HttpHeaders responseHeaders) {
+      super(googleJsonError.getMessage());
+      this.googleJsonError = googleJsonError;
+      this.responseHeaders = responseHeaders;
+    }
+
+    public GoogleJsonError getGoogleJsonError() {
+      return googleJsonError;
+    }
+
+    public HttpHeaders getResponseHeaders() {
+      return responseHeaders;
     }
   }
 }

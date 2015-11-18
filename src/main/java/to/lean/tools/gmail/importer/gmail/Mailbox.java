@@ -25,9 +25,10 @@ import com.google.api.client.http.HttpHeaders;
 import com.google.api.client.repackaged.com.google.common.base.Preconditions;
 import com.google.api.services.gmail.Gmail;
 import com.google.api.services.gmail.model.Label;
-import com.google.api.services.gmail.model.ListMessagesResponse;
+import com.google.api.services.gmail.model.ListLabelsResponse;
 import com.google.api.services.gmail.model.Message;
 import com.google.api.services.gmail.model.ModifyMessageRequest;
+import com.google.common.base.Verify;
 import com.google.common.collect.BiMap;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
@@ -38,15 +39,23 @@ import com.google.common.io.ByteStreams;
 import to.lean.tools.gmail.importer.local.LocalMessage;
 
 import javax.inject.Inject;
-import javax.inject.Provider;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.ExecutionException;
+import java.util.function.BiFunction;
+import java.util.function.Supplier;
+import java.util.logging.Logger;
 import java.util.stream.Collectors;
 
+import static com.google.common.base.Verify.verify;
+import static java.util.stream.Collectors.joining;
 import static java.util.stream.Collectors.toList;
 import static java.util.stream.Collectors.toMap;
 import static java.util.stream.Collectors.toSet;
@@ -60,180 +69,168 @@ import static java.util.stream.Collectors.toSet;
 class Mailbox {
   static final int TOO_MANY_CONCURRENT_REQUESTS_FOR_USER = 429;
 
-  private final Provider<Gmail> gmailApiProvider;
   private final User user;
   private final GmailService gmailService;
+  private final Logger logger;
+
+  private List<Label> labels;
+  private Map<String, Label> labelsById;
+  private Map<String, Label> labelsByName;
 
   @Inject
   Mailbox(
-      Provider<Gmail> gmailApiProvider,
       GmailServiceFactory gmailServiceFactory,
-      User user) {
-    this.gmailApiProvider = gmailApiProvider;
+      User user,
+      Logger logger) {
     this.user = user;
     this.gmailService = gmailServiceFactory.create(user);
+    this.logger = logger;
   }
 
-  void connect() throws IOException {
+  void connect() throws InterruptedException {
+    loadLabels();
+  }
+
+  public ImmutableList<Label> labels() throws
+      GmailService.GmailServiceException {
+    return ImmutableList.copyOf(labels);
+  }
+
+  public Optional<Label> getLabelById(String id) {
+    return Optional.ofNullable(labelsById.get(id));
+  }
+
+  public Optional<Label> getLabelByName(String name) {
+    return Optional.ofNullable(labelsByName.get(name));
+  }
+
+  public Label createLabel(String name) {
+    throw new UnsupportedOperationException();
+  }
+
+  private void loadLabels() throws InterruptedException {
+    if (labels != null) {
+      return;
+    }
+
+    ListLabelsResponse labelResponse;
+    try {
+      labelResponse = gmailService.labels().get();
+    } catch (ExecutionException e) {
+      throw GmailService.GmailServiceException.forException(e);
+    }
+
+    verify(!labelResponse.isEmpty(), "could not get labels");
+
+    labels = labelResponse.getLabels();
+    labelsByName =
+        labels.stream().collect(toMap(Label::getName, label -> label));
+    labelsById = labels.stream().collect(toMap(Label::getId, label -> label));
+    System.err.format("Got labels: %s", labelsByName);
   }
 
   Multimap<LocalMessage, Message> mapMessageIds(
-      Iterable<LocalMessage> localMessages) {
+      Iterable<LocalMessage> localMessages) throws InterruptedException {
     Multimap<LocalMessage, Message> results =
         MultimapBuilder.hashKeys().linkedListValues().build();
 
-    Gmail gmail = gmailApiProvider.get();
-    BatchRequest batch = gmail.batch();
+    GmailService.Batch batch = gmailService.newBatch();
 
+    for (LocalMessage localMessage : localMessages) {
+      batch.query(GmailService.Query.builder()
+          .rfc822MsgId(localMessage.getMessageId())
+          .setField(GmailService.Field.MESSAGE_ID)
+          .build())
+          .thenAccept(response -> {
+            if (!response.isEmpty()) {
+              results.putAll(localMessage, response.getMessages());
+              logger.fine(() -> {
+                String s = "For " + localMessage.getMessageId() + " got:\n";
+                return s + response.getMessages().stream()
+                    .map(message -> "  message id: " + message.getId() + "\n")
+                    .collect(joining("\n"));
+              });
+            }
+          });
+    }
     try {
-      for (LocalMessage localMessage : localMessages) {
-        gmail.users().messages().list(user.getEmailAddress())
-            .setQ("rfc822msgid:" + localMessage.getMessageId())
-            .setFields("messages(id)")
-            .queue(batch, new JsonBatchCallback<ListMessagesResponse>() {
-              @Override
-              public void onFailure(
-                  GoogleJsonError e, HttpHeaders responseHeaders)
-                  throws IOException {
-                System.err.println("Could not get message: "
-                    + localMessage.getMessageId());
-                System.err.println("  because: " + e);
-              }
-
-              @Override
-              public void onSuccess(
-                  ListMessagesResponse response, HttpHeaders responseHeaders)
-                  throws IOException {
-                if (!response.isEmpty()) {
-                  results.putAll(localMessage, response.getMessages());
-                  System.err.println(
-                      "For " + localMessage.getMessageId() + " got:");
-                  response.getMessages().stream().forEach(message ->
-                      System.err.println("  message id: " + message.getId()));
-                }
-              }
-            });
-      }
-      if (batch.size() > 0) {
-        batch.execute();
-      }
-    } catch (IOException e) {
-      throw new RuntimeException(e);
+      batch.execute().get();
+    } catch (ExecutionException e) {
+      throw GmailService.GmailServiceException.forException(e);
     }
 
     return results;
   }
 
-  void fetchExistingLabels(Iterable<Message> messages) {
-    Gmail gmail = gmailApiProvider.get();
-    BatchRequest batch = gmail.batch();
+  void fetchExistingLabels(Iterable<Message> messages)
+      throws InterruptedException {
+    GmailService.Batch batch = gmailService.newBatch();
 
     try {
       for (Message message : messages) {
-        gmail.users().messages().get(user.getEmailAddress(), message.getId())
-            .setFields("id,labelIds")
-            .queue(batch, new JsonBatchCallback<Message>() {
-              @Override
-              public void onFailure(
-                  GoogleJsonError e, HttpHeaders responseHeaders)
-                  throws IOException {
-                System.err.format("For message: %s, got error: %s\n",
-                    message.getId(), e.toPrettyString());
-              }
-
-              @Override
-              public void onSuccess(
-                  Message responseMessage, HttpHeaders responseHeaders)
-                  throws IOException {
-                Preconditions.checkState(
-                    message.getId().equals(responseMessage.getId()),
-                    "Message ids must be equal");
-                List<String> gmailMessageIds =
-                    responseMessage.getLabelIds() == null
-                        ? ImmutableList.of()
-                        : responseMessage.getLabelIds();
-                System.out.format("For message %s, got labels: %s\n",
-                    responseMessage.getId(),
-                    gmailMessageIds.stream()
-                        .map(id -> gmailService.getLabelById(id)
-                            .orElse(new Label().setName(id)))
-                        .map(Label::getName)
-                        .collect(Collectors.joining(", ")));
-                message.setLabelIds(gmailMessageIds);
-              }
+        batch.message(message.getId(), "id,labelIds")
+            .thenAccept(responseMessage -> {
+              Verify.verify(
+                  message.getId().equals(responseMessage.getId()),
+                  "Message ids must be equal %s:%s",
+                  message.getId(), responseMessage.getId());
+              List<String> gmailMessageIds =
+                  responseMessage.getLabelIds() == null
+                      ? ImmutableList.of()
+                      : responseMessage.getLabelIds();
+              logger.fine(() -> String.format(
+                  "For message %s, got labels: %s\n",
+                  responseMessage.getId(),
+                  gmailMessageIds.stream()
+                      .map(id -> getLabelById(id)
+                          .orElse(new Label().setName(id)))
+                      .map(Label::getName)
+                      .collect(Collectors.joining(", "))));
+              message.setLabelIds(gmailMessageIds);
             });
       }
-      if (batch.size() > 0) {
-        batch.execute();
-      }
-    } catch (IOException e) {
-      throw new RuntimeException(e);
+      batch.execute().get();
+    } catch (ExecutionException e) {
+      throw GmailService.GmailServiceException.forException(e);
     }
   }
 
   Message uploadMessage(LocalMessage localMessage)
-      throws GoogleJsonResponseException {
-    Gmail gmail = gmailApiProvider.get();
+      throws InterruptedException {
+
     try {
-      Gmail.Users.Messages.GmailImport r = gmail.users()
-          .messages()
-          .gmailImport(user.getEmailAddress(),
-              new Message(),
-              new AbstractInputStreamContent("message/rfc822") {
-                byte[] bytes = localMessage.getRawContent();
+      return gmailService.importMessage(
+          new AbstractInputStreamContent("message/rfc822") {
+            byte[] bytes = localMessage.getRawContent();
 
-                @Override
-                public InputStream getInputStream() throws IOException {
-                  return new ByteArrayInputStream(bytes);
-                }
+            @Override
+            public InputStream getInputStream() throws IOException {
+              return new ByteArrayInputStream(bytes);
+            }
 
-                @Override
-                public long getLength() throws IOException {
-                  return bytes.length;
-                }
+            @Override
+            public long getLength() throws IOException {
+              return bytes.length;
+            }
 
-                @Override
-                public boolean retrySupported() {
-                  return true;
-                }
-              });
-      r.getMediaHttpUploader().setProgressListener(uploader -> {
-        System.out.format("[%s] Progress: %2.0f        \r",
-            uploader.getUploadState().toString(),
-            uploader.getProgress() * 100);
-        System.out.flush();
-      });
-      System.out.println();
-      Message result = r.execute();
-      System.out.println(result.toPrettyString());
-      return result;
-    } catch (GoogleJsonResponseException e) {
-      if (e.getDetails().getMessage().equalsIgnoreCase("Invalid From header")) {
-        throw e;
-      }
-      throw new RuntimeException(e);
-    } catch (IOException e) {
-      System.err.format("Failed to upload message: \n");
-      try {
-        ByteStreams.copy(
-            new ByteArrayInputStream(localMessage.getRawContent()), System.err);
-      } catch (IOException e1) {
-        System.err.format("Holy shit Batman! Error within an error! (%s)",
-            e.getMessage());
-      }
-      throw new RuntimeException(e);
+            @Override
+            public boolean retrySupported() {
+              return true;
+            }
+          }).get();
+    } catch (ExecutionException e) {
+      throw GmailService.GmailServiceRequestException.forException(e);
     }
   }
 
   void syncLocalLabelsToGmail(Multimap<LocalMessage, Message> map) {
     class Batches {
-      BatchRequest thisBatch;
-      BatchRequest nextBatch;
+      GmailService.Batch thisBatch;
+      GmailService.Batch nextBatch;
     }
-    Gmail gmail = gmailApiProvider.get();
     Batches batches = new Batches();
-    batches.thisBatch = gmail.batch();
-    batches.nextBatch = gmail.batch();
+    batches.thisBatch = gmailService.newBatch();
+    batches.nextBatch = gmailService.newBatch();
 
     try {
       for (Map.Entry<LocalMessage, Message> entry : map.entries()) {
@@ -265,19 +262,18 @@ class Mailbox {
 
         List<String> labelIdsToAdd = labelNamesToAdd.stream()
             .map(labelName ->
-                gmailService.getLabelByName(labelName).get().getId())
+                getLabelByName(labelName).get().getId())
             .collect(toList());
         List<String> labelIdsToRemove = labelNamesToRemove.stream()
             .map(labelName ->
-                gmailService.getLabelByName(labelName).get().getId())
+                getLabelByName(labelName).get().getId())
             .collect(toList());
-
-        Gmail.Users.Messages.Modify request = gmail.users()
-            .messages()
-            .modify(user.getEmailAddress(), message.getId(),
-                new ModifyMessageRequest()
-                    .setAddLabelIds(labelIdsToAdd)
-                    .setRemoveLabelIds(labelIdsToRemove));
+/*
+        CompletableFuture<Message> future =
+            new Retrier<Message>(() ->
+                    batches.thisBatch.modify(
+                        message.getId(), labelIdsToAdd, labelIdsToRemove))
+                .future();
 
         JsonBatchCallback<Message> callback = new JsonBatchCallback<Message>() {
           @Override
@@ -299,16 +295,17 @@ class Mailbox {
           }
         };
         request.queue(batches.thisBatch, callback);
+        */
       }
-
+/*
       while (batches.thisBatch.size() > 0) {
         batches.thisBatch.execute();
         batches.thisBatch = batches.nextBatch;
         batches.nextBatch = gmail.batch();
       }
     } catch (IOException e) {
-      throw new RuntimeException(e);
-    }
+      throw new RuntimeException(e); */
+    } finally {}
   }
 
   String normalizeLabelName(String localLabel) {
@@ -435,6 +432,33 @@ class Mailbox {
             });
       }
       batchRequest.execute();
+    }
+  }
+
+  private static class Retrier<T>
+      implements BiFunction<T, Throwable, T> {
+    private final Supplier<CompletableFuture<T>> futureFactory;
+
+    Retrier(Supplier<CompletableFuture<T>> futureFactory) {
+      this.futureFactory = futureFactory;
+    }
+
+    @Override
+    public T apply(T result, Throwable throwable) {
+      if (throwable
+          instanceof GmailService.GmailServiceRequestException) {
+        GmailService.GmailServiceRequestException requestException =
+            (GmailService.GmailServiceRequestException) throwable;
+        if (requestException.getGoogleJsonError().getCode()
+            == TOO_MANY_CONCURRENT_REQUESTS_FOR_USER) {
+
+        }
+      }
+      throw new CompletionException(throwable);
+    }
+
+    public CompletableFuture<T> future() {
+      return futureFactory.get().handleAsync(this);
     }
   }
 }

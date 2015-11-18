@@ -45,7 +45,7 @@ public class GmailSyncer {
    *
    * @throws IOException if something goes wrong with the connection
    */
-  public void init() throws IOException {
+  public void init() throws IOException, InterruptedException {
     mailbox.connect();
     this.initialized = true;
   }
@@ -64,10 +64,12 @@ public class GmailSyncer {
    *     or may not already exist in Gmail.
    * @throws IOException if something goes wrong with the connection
    */
-  public void sync(List<LocalMessage> messages) throws IOException {
+  public void sync(List<LocalMessage> messages)
+      throws IOException, InterruptedException {
     Preconditions.checkState(initialized,
         "GmailSyncer.init() must be called first");
     Multimap<LocalMessage, Message> map = mailbox.mapMessageIds(messages);
+    /*
     messages.stream()
         .filter(message -> !map.containsKey(message))
         .forEach(message -> {
@@ -78,6 +80,7 @@ public class GmailSyncer {
             // Message couldn't be uploaded, but we know why
           }
         });
+    */
     mailbox.fetchExistingLabels(map.values());
     mailbox.syncLocalLabelsToGmail(map);
   }

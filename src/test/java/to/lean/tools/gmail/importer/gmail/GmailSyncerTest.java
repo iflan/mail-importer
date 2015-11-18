@@ -78,7 +78,7 @@ public class GmailSyncerTest {
     gmailSyncer.sync(localMessages);
   }
 
-  private void setUpEmptyMailbox() {
+  private void setUpEmptyMailbox() throws Exception {
     when(mailbox.mapMessageIds(anyListOf(LocalMessage.class)))
         .thenAnswer(invocation -> {
           return MultimapBuilder.hashKeys().linkedListValues().build();
